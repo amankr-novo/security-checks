@@ -150,37 +150,40 @@ function parseYarnLock(repoPath) {
     const lines = content.split('\n');
     
     let currentPackage = null;
-    let currentVersion = null;
+    let inPackageBlock = false;
     
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       
       // Match package declaration lines like: "@package/name@^1.0.0", "@package/name@^1.0.0":
+      // Or: "package-name@^1.0.0", "package-name@^1.0.0":
       // Extract package name from the first entry
-      if (line.match(/^"@?[^"]+"@[^"]+":$/)) {
-        const match = line.match(/^"(@?[^"]+)"@/);
-        if (match) {
-          currentPackage = match[1];
-          currentVersion = null;
-        }
-      } else if (line.startsWith('version "') && currentPackage) {
+      const packageMatch = line.match(/^"(@?[^"@]+)"@[^"]+":$/);
+      if (packageMatch) {
+        currentPackage = packageMatch[1];
+        inPackageBlock = true;
+        continue;
+      }
+      
+      // Check for version within a package block
+      if (inPackageBlock && currentPackage && line.startsWith('version "')) {
         const versionMatch = line.match(/version "([^"]+)"/);
         if (versionMatch) {
-          currentVersion = versionMatch[1];
+          const version = versionMatch[1];
           if (!lockData[currentPackage]) {
             lockData[currentPackage] = [];
           }
           // Only add if not already present (avoid duplicates)
-          if (!lockData[currentPackage].includes(currentVersion)) {
-            lockData[currentPackage].push(currentVersion);
+          if (!lockData[currentPackage].includes(version)) {
+            lockData[currentPackage].push(version);
           }
         }
-      } else if (line === '') {
-        // Reset on empty line (new package section)
-        if (i > 0 && lines[i - 1].trim().startsWith('integrity')) {
-          currentPackage = null;
-          currentVersion = null;
-        }
+      }
+      
+      // Reset on empty line (new package section)
+      if (line === '' && inPackageBlock) {
+        currentPackage = null;
+        inPackageBlock = false;
       }
     }
   } catch (error) {
@@ -190,9 +193,43 @@ function parseYarnLock(repoPath) {
   return lockData;
 }
 
+// Check if a version specifier matches a specific version
+// Handles exact matches like "1.0.0", "=1.0.0", "^1.0.0", etc.
+function versionSpecMatches(versionSpec, targetVersion) {
+  // Remove whitespace
+  const spec = versionSpec.trim();
+  
+  // Check for exact match (with or without = prefix)
+  if (spec === targetVersion || spec === `=${targetVersion}`) {
+    return true;
+  }
+  
+  // Remove common prefix operators for comparison
+  const cleanSpec = spec.replace(/^[~^>=<]+\s*/, '').trim();
+  
+  // Check if the cleaned spec exactly matches the target version
+  if (cleanSpec === targetVersion) {
+    return true;
+  }
+  
+  // For range operators, check if the base version matches
+  // This is conservative - we flag if the base version matches
+  // e.g., "^1.0.0" or "~1.0.0" could potentially resolve to "1.0.0"
+  if (spec.startsWith('^') || spec.startsWith('~') || spec.startsWith('>=') || spec.startsWith('<=')) {
+    // Extract the base version (first part before any additional constraints)
+    const baseVersion = cleanSpec.split(/\s+/)[0];
+    if (baseVersion === targetVersion) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
 // Check for compromised packages
 function checkCompromisedPackages(packageJson, yarnLock, compromisedPackages) {
   const findings = [];
+  const reportedPackages = new Set(); // Track reported packages to avoid duplicates
   
   if (!packageJson) return findings;
   
@@ -207,33 +244,45 @@ function checkCompromisedPackages(packageJson, yarnLock, compromisedPackages) {
       
       // Check if it's an array of versions (compromised versions list)
       if (Array.isArray(compromisedVersions)) {
-        // Get exact version from yarn.lock if available
+        // First, check exact versions from yarn.lock (most reliable)
         const exactVersions = yarnLock[pkgName] || [];
         
         for (const exactVersion of exactVersions) {
           if (compromisedVersions.includes(exactVersion)) {
-            findings.push({
-              type: 'compromised_package',
-              severity: 'CRITICAL',
-              package: pkgName,
-              version: exactVersion,
-              versionSpec: versionSpec,
-              source: 'yarn.lock'
-            });
+            const key = `${pkgName}@${exactVersion}`;
+            if (!reportedPackages.has(key)) {
+              findings.push({
+                type: 'compromised_package',
+                severity: 'CRITICAL',
+                package: pkgName,
+                version: exactVersion,
+                versionSpec: versionSpec,
+                source: 'yarn.lock'
+              });
+              reportedPackages.add(key);
+            }
           }
         }
         
-        // Also check if version spec matches any compromised version
-        for (const compromisedVersion of compromisedVersions) {
-          if (versionSpec.includes(compromisedVersion) || versionSpec === compromisedVersion) {
-            findings.push({
-              type: 'compromised_package',
-              severity: 'CRITICAL',
-              package: pkgName,
-              version: compromisedVersion,
-              versionSpec: versionSpec,
-              source: 'package.json'
-            });
+        // If yarn.lock doesn't have this package or no matches found,
+        // check package.json version spec for exact matches
+        // This handles cases where yarn.lock might not exist or package isn't in lock file
+        if (exactVersions.length === 0 || !exactVersions.some(v => compromisedVersions.includes(v))) {
+          for (const compromisedVersion of compromisedVersions) {
+            if (versionSpecMatches(versionSpec, compromisedVersion)) {
+              const key = `${pkgName}@${compromisedVersion}`;
+              if (!reportedPackages.has(key)) {
+                findings.push({
+                  type: 'compromised_package',
+                  severity: 'CRITICAL',
+                  package: pkgName,
+                  version: compromisedVersion,
+                  versionSpec: versionSpec,
+                  source: 'package.json'
+                });
+                reportedPackages.add(key);
+              }
+            }
           }
         }
       }
